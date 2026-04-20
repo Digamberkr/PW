@@ -23,10 +23,11 @@ Sub CATMain()
     Set selection = doc.Selection
     selection.Clear
 
-    Dim filter(2)
+    Dim filter(3)
     filter(0) = "Face"
     filter(1) = "Edge"
     filter(2) = "Vertex"
+    filter(3) = "Point"
 
     Dim status As String
     status = selection.SelectElement2(filter, _
@@ -53,6 +54,9 @@ Sub CATMain()
                 vbExclamation, "PrepareElectricalPart"
             GoTo ContinueLoop
         End If
+        
+        Dim product As Product
+        Set product = GetProductFromSelection(selItem, doc)
 
         Dim ref As Reference
         Set ref = selItem.Reference
@@ -69,7 +73,22 @@ Sub CATMain()
         Set meas = spa.GetMeasurable(ref)
 
         Dim x As Double, y As Double, z As Double
-        meas.GetCOG x, y, z
+        Dim hasPoint As Boolean
+        hasPoint = False
+        
+        If selItem.Type = "Vertex" Or selItem.Type = "Point" Then
+            On Error Resume Next
+            meas.GetPoint x, y, z
+            If Err.Number = 0 Then
+                hasPoint = True
+            End If
+            Err.Clear
+            On Error GoTo 0
+        End If
+        
+        If Not hasPoint Then
+            meas.GetCOG x, y, z
+        End If
 
         Dim point As HybridShapePointCoord
         Set point = hsFactory.AddNewPointCoord(x, y, z)
@@ -83,6 +102,7 @@ Sub CATMain()
 
         Dim vx As Double, vy As Double, vz As Double
         Dim nx As Double, ny As Double, nz As Double
+        Dim wx As Double, wy As Double, wz As Double
 
         Select Case selItem.Type
             Case "Face"
@@ -102,7 +122,6 @@ Sub CATMain()
                 End If
                 CrossProduct nx, ny, nz, vx, vy, vz, vx, vy, vz
                 NormalizeVector vx, vy, vz
-                Dim wx As Double, wy As Double, wz As Double
                 CrossProduct vx, vy, vz, nx, ny, nz, wx, wy, wz
                 NormalizeVector wx, wy, wz
 
@@ -152,7 +171,7 @@ Sub CATMain()
         On Error GoTo 0
 
         If doElectrify Then
-            TryCreateBCP part, point, axis
+            TryCreateBCP part, product, point, axis, doElectrify
         End If
 
 ContinueLoop:
@@ -184,6 +203,32 @@ Function GetPartFromSelection(selItem)
     Set GetPartFromSelection = p
 End Function
 
+Function GetProductFromSelection(selItem, doc)
+    On Error Resume Next
+    Dim obj
+    Set obj = selItem.Value
+    
+    Dim p As Product
+    Set p = Nothing
+    
+    Do While Not obj Is Nothing
+        If TypeName(obj) = "Product" Then
+            Set p = obj
+            Exit Do
+        End If
+        Set obj = obj.Parent
+    Loop
+    
+    If p Is Nothing Then
+        If TypeName(doc) = "ProductDocument" Then
+            Set p = doc.Product
+        End If
+    End If
+    
+    Set GetProductFromSelection = p
+    On Error GoTo 0
+End Function
+
 Function EnsureGeometricalSet(part, setName)
     Dim hb As HybridBody
     Dim hbs As HybridBodies
@@ -202,13 +247,11 @@ Function EnsureGeometricalSet(part, setName)
     Set EnsureGeometricalSet = hb
 End Function
 
-Sub TryCreateBCP(part, point, axis)
+Sub TryCreateBCP(part, product, point, axis, allowElectrify)
     On Error Resume Next
-
     Dim elecPart
-    Set elecPart = part.GetItem("ElectricalPart")
-    If Err.Number <> 0 Then
-        Err.Clear
+    Set elecPart = GetElectricalPart(part, product, allowElectrify)
+    If elecPart Is Nothing Then
         Exit Sub
     End If
 
@@ -222,6 +265,39 @@ Sub TryCreateBCP(part, point, axis)
     ' If the API differs, this will silently fail; geometry + publications remain.
     On Error GoTo 0
 End Sub
+
+Function GetElectricalPart(part, product, allowElectrify)
+    On Error Resume Next
+    Dim elecPart
+    
+    Set elecPart = part.GetItem("ElectricalPart")
+    If Err.Number = 0 And Not elecPart Is Nothing Then
+        Set GetElectricalPart = elecPart
+        Exit Function
+    End If
+    Err.Clear
+    
+    If allowElectrify Then
+        If Not product Is Nothing Then
+            Set elecPart = product.GetTechnologicalObject("ElectricalPart")
+            If Err.Number = 0 And Not elecPart Is Nothing Then
+                Set GetElectricalPart = elecPart
+                Exit Function
+            End If
+            Err.Clear
+        End If
+        
+        Set elecPart = part.GetTechnologicalObject("ElectricalPart")
+        If Err.Number = 0 And Not elecPart Is Nothing Then
+            Set GetElectricalPart = elecPart
+            Exit Function
+        End If
+        Err.Clear
+    End If
+    
+    Set GetElectricalPart = Nothing
+    On Error GoTo 0
+End Function
 
 Sub NormalizeVector(ByRef x, ByRef y, ByRef z)
     Dim n As Double
