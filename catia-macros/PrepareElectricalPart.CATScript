@@ -1,0 +1,241 @@
+'Language="VBSCRIPT"
+
+' =============================================================
+'  PrepareElectricalPart.CATScript
+'  CATIA V5-6R2017 (HF51) macro
+'  Creates reference points, axis systems, publications, and
+'  attempts to create Electrical Bundle Connection Points (BCP)
+'  for selected geometry.
+' =============================================================
+
+Option Explicit
+
+Sub CATMain()
+
+    Dim doc As Document
+    Set doc = CATIA.ActiveDocument
+    If doc Is Nothing Then
+        MsgBox "No active document.", vbExclamation, "PrepareElectricalPart"
+        Exit Sub
+    End If
+
+    Dim selection As Selection
+    Set selection = doc.Selection
+    selection.Clear
+
+    Dim filter(2)
+    filter(0) = "Face"
+    filter(1) = "Edge"
+    filter(2) = "Vertex"
+
+    Dim status As String
+    status = selection.SelectElement2(filter, _
+        "Select faces/edges/points for BCP creation. Click OK when done.", True)
+
+    If status <> "Normal" Then
+        selection.Clear
+        Exit Sub
+    End If
+
+    Dim doElectrify As Boolean
+    doElectrify = (MsgBox("Electrify components and create BCPs where possible?", _
+        vbYesNo + vbQuestion, "PrepareElectricalPart") = vbYes)
+
+    Dim i As Integer
+    For i = 1 To selection.Count
+        Dim selItem As SelectedElement
+        Set selItem = selection.Item(i)
+
+        Dim part As Part
+        Set part = GetPartFromSelection(selItem)
+        If part Is Nothing Then
+            MsgBox "Skipping selection " & CStr(i) & " (could not resolve Part).", _
+                vbExclamation, "PrepareElectricalPart"
+            GoTo ContinueLoop
+        End If
+
+        Dim ref As Reference
+        Set ref = selItem.Reference
+
+        Dim hsFactory As HybridShapeFactory
+        Set hsFactory = part.HybridShapeFactory
+
+        Dim geoSet As HybridBody
+        Set geoSet = EnsureGeometricalSet(part, "Electrical_References")
+
+        Dim spa As Workbench
+        Set spa = doc.GetWorkbench("SPAWorkbench")
+        Dim meas As Measurable
+        Set meas = spa.GetMeasurable(ref)
+
+        Dim x As Double, y As Double, z As Double
+        meas.GetCOG x, y, z
+
+        Dim point As HybridShapePointCoord
+        Set point = hsFactory.AddNewPointCoord(x, y, z)
+        geoSet.AppendHybridShape point
+        part.UpdateObject point
+
+        Dim axis As HybridShapeAxisSystem
+        Set axis = hsFactory.AddNewAxisSystem()
+        axis.OriginType = 0
+        axis.SetOrigin point
+
+        Dim vx As Double, vy As Double, vz As Double
+        Dim nx As Double, ny As Double, nz As Double
+
+        Select Case selItem.Type
+            Case "Face"
+                On Error Resume Next
+                meas.GetNormal nx, ny, nz
+                If Err.Number <> 0 Then
+                    Err.Clear
+                    nx = 0: ny = 0: nz = 1
+                End If
+                On Error GoTo 0
+
+                NormalizeVector nx, ny, nz
+                ' Build an X axis using global X unless parallel
+                vx = 1: vy = 0: vz = 0
+                If Abs(nx * vx + ny * vy + nz * vz) > 0.95 Then
+                    vx = 0: vy = 1: vz = 0
+                End If
+                CrossProduct nx, ny, nz, vx, vy, vz, vx, vy, vz
+                NormalizeVector vx, vy, vz
+                Dim wx As Double, wy As Double, wz As Double
+                CrossProduct vx, vy, vz, nx, ny, nz, wx, wy, wz
+                NormalizeVector wx, wy, wz
+
+                axis.PutXAxis vx, vy, vz
+                axis.PutYAxis wx, wy, wz
+                axis.PutZAxis nx, ny, nz
+
+            Case "Edge"
+                On Error Resume Next
+                meas.GetTangent vx, vy, vz
+                If Err.Number <> 0 Then
+                    Err.Clear
+                    vx = 1: vy = 0: vz = 0
+                End If
+                On Error GoTo 0
+
+                NormalizeVector vx, vy, vz
+                ' Use global Z as up
+                nx = 0: ny = 0: nz = 1
+                If Abs(vx * nx + vy * ny + vz * nz) > 0.95 Then
+                    nx = 0: ny = 1: nz = 0
+                End If
+                CrossProduct vx, vy, vz, nx, ny, nz, wx, wy, wz
+                NormalizeVector wx, wy, wz
+                CrossProduct wx, wy, wz, vx, vy, vz, nx, ny, nz
+                NormalizeVector nx, ny, nz
+
+                axis.PutXAxis vx, vy, vz
+                axis.PutYAxis wx, wy, wz
+                axis.PutZAxis nx, ny, nz
+
+            Case Else
+                axis.PutXAxis 1, 0, 0
+                axis.PutYAxis 0, 1, 0
+                axis.PutZAxis 0, 0, 1
+        End Select
+
+        geoSet.AppendHybridShape axis
+        part.UpdateObject axis
+
+        ' Publications
+        Dim pubs As Publications
+        Set pubs = part.Publications
+        On Error Resume Next
+        pubs.Add point, "BCP_Point_" & CStr(i)
+        pubs.Add axis, "BCP_Axis_" & CStr(i)
+        On Error GoTo 0
+
+        If doElectrify Then
+            TryCreateBCP part, point, axis
+        End If
+
+ContinueLoop:
+    Next
+
+    selection.Clear
+    MsgBox "Preparation complete.", vbInformation, "PrepareElectricalPart"
+
+End Sub
+
+' ---- Helpers ----
+
+Function GetPartFromSelection(selItem)
+    On Error Resume Next
+    Dim obj
+    Set obj = selItem.Value
+
+    Dim p As Part
+    Set p = Nothing
+
+    Do While Not obj Is Nothing
+        If TypeName(obj) = "Part" Then
+            Set p = obj
+            Exit Do
+        End If
+        Set obj = obj.Parent
+    Loop
+
+    Set GetPartFromSelection = p
+End Function
+
+Function EnsureGeometricalSet(part, setName)
+    Dim hb As HybridBody
+    Dim hbs As HybridBodies
+    Set hbs = part.HybridBodies
+
+    Dim i
+    For i = 1 To hbs.Count
+        If hbs.Item(i).Name = setName Then
+            Set EnsureGeometricalSet = hbs.Item(i)
+            Exit Function
+        End If
+    Next
+
+    Set hb = hbs.Add()
+    hb.Name = setName
+    Set EnsureGeometricalSet = hb
+End Function
+
+Sub TryCreateBCP(part, point, axis)
+    On Error Resume Next
+
+    Dim elecPart
+    Set elecPart = part.GetItem("ElectricalPart")
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Sub
+    End If
+
+    Dim refPoint As Reference
+    Dim refAxis As Reference
+    Set refPoint = part.CreateReferenceFromObject(point)
+    Set refAxis = part.CreateReferenceFromObject(axis)
+
+    Err.Clear
+    elecPart.AddBundleConnectionPoint refPoint, refAxis
+    ' If the API differs, this will silently fail; geometry + publications remain.
+    On Error GoTo 0
+End Sub
+
+Sub NormalizeVector(ByRef x, ByRef y, ByRef z)
+    Dim n As Double
+    n = Sqr(x * x + y * y + z * z)
+    If n = 0 Then
+        x = 1: y = 0: z = 0
+    Else
+        x = x / n: y = y / n: z = z / n
+    End If
+End Sub
+
+Sub CrossProduct(ax, ay, az, bx, by, bz, ByRef cx, ByRef cy, ByRef cz)
+    cx = ay * bz - az * by
+    cy = az * bx - ax * bz
+    cz = ax * by - ay * bx
+End Sub
+' END
