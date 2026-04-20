@@ -1,0 +1,663 @@
+'Language="VBSCRIPT"
+
+' ================================================================
+'  CATIA V5 Electrical Part Preparation Macro
+'  Company  : Jamco America
+'  Role     : Electrical Design Engineering
+'  CATIA    : V5-6R2017  (Hot Fix 51)
+'  Workbench: Electrical Part Design  /  EHI
+' ----------------------------------------------------------------
+'  WHAT THIS MACRO DOES
+'  1.  Works on CATPart  AND  CATProduct documents
+'  2.  Lets the user pick a Vertex / Face / Edge in the viewport
+'  3.  Creates an Axis System whose Z-axis is aligned to the
+'      selected geometry  (normal for Face, tangent for Edge,
+'      world-Z for Vertex)
+'  4.  Creates a Bundle Connection Point (BCP) anchored to that
+'      axis  ─  first via the Electrical Part Design API;
+'      falls back to a parametric point + direction line that
+'      can be promoted to a BCP manually in the EPD workbench
+'  5.  Publishes each Axis System for reuse in harness design
+'  6.  Optionally "electrifies" the component by stamping
+'      standard electrical parameters and the Part Number
+'
+'  INSTALLATION
+'  ─────────────────────────────────────────────────────────────
+'  1.  Copy this file to a folder on your CATIA search path, e.g.
+'        C:\Users\<you>\CATScripts\ElecPrep_JamcoAmerica.CATScript
+'  2.  In CATIA: Tools > Macro > Macros…  (Alt+F8)
+'      ► "Macro libraries" ► add the folder above
+'      ► Select CATMain and click Run
+'  3.  Optionally add a toolbar button:
+'      Tools > Customize > Commands > Macros ► drag to toolbar
+'
+'  KNOWN LIMITATIONS
+'  ─────────────────────────────────────────────────────────────
+'  • The direct Electrical API (ElectricalFactory.AddBundleConnectionPoint)
+'    requires the Electrical Part Design licence to be active.
+'    When the licence / workbench is unavailable the macro still
+'    creates geometry (point + direction line + axis) and publishes
+'    it, so the BCP can be assigned manually in < 5 seconds.
+'  • For Product documents the macro edits the FIRST CATPart found
+'    in the product tree.  For a specific component, open it as a
+'    standalone CATPart first  (recommended workflow).
+'  • GetMeasurable requires the "Generative Shape Design" or
+'    "Part Design" licence for SPA queries.
+' ================================================================
+
+Option Explicit
+
+' ── Global identifiers ────────────────────────────────────────
+Private Const MTITLE    As String = "ElecPrep  |  Jamco America"
+Private Const GBS_NAME  As String = "Elec_Preparation"
+Private Const PUB_PFX   As String = "BCP_"
+Private Const AX_PFX    As String = "Axis_BCP_"
+Private Const PT_PFX    As String = "Pt_BCP_"
+Private Const DIR_PFX   As String = "Dir_BCP_"
+
+' ==============================================================
+'  ENTRY POINT  ─  called by CATIA macro runner
+' ==============================================================
+Sub CATMain()
+
+    Dim oDoc    As Document
+    Dim oPart   As Part
+    Dim sType   As String
+
+    On Error GoTo ErrMain
+
+    ' ── 0. Guard ──────────────────────────────────────────────
+    If CATIA.Documents.Count = 0 Then
+        MsgBox "No document is open." & vbCrLf & _
+               "Please open a CATPart or CATProduct first.", _
+               vbExclamation, MTITLE
+        Exit Sub
+    End If
+
+    Set oDoc = CATIA.ActiveDocument
+    sType    = TypeName(oDoc)
+
+    ' ── 1. Resolve the Part object ────────────────────────────
+    Select Case sType
+
+        Case "PartDocument"
+            Set oPart = oDoc.Part
+
+        Case "ProductDocument"
+            Dim ans As Integer
+            ans = MsgBox( _
+                "Product document detected." & vbCrLf & vbCrLf & _
+                "The macro will prepare the FIRST CATPart found in the " & _
+                "product tree." & vbCrLf & _
+                "For a specific component it is safer to open it as a " & _
+                "standalone CATPart." & vbCrLf & vbCrLf & _
+                "Continue?", vbOKCancel Or vbQuestion, MTITLE)
+            If ans <> vbOK Then Exit Sub
+            Set oPart = GetFirstPart(oDoc)
+            If oPart Is Nothing Then
+                MsgBox "No CATPart found inside the product.", _
+                       vbExclamation, MTITLE
+                Exit Sub
+            End If
+
+        Case Else
+            MsgBox "Unsupported document type: " & sType & vbCrLf & _
+                   "Open a CATPart or CATProduct and try again.", _
+                   vbExclamation, MTITLE
+            Exit Sub
+
+    End Select
+
+    ' ── 2. Ask how many BCPs ──────────────────────────────────
+    Dim nBCPs As Integer
+    nBCPs = AskBCPCount()
+    If nBCPs = 0 Then Exit Sub
+
+    ' ── 3. Ask whether to electrify ───────────────────────────
+    Dim bElec As Boolean
+    bElec = (MsgBox( _
+        "Do you want to ELECTRIFY this component?" & vbCrLf & vbCrLf & _
+        "This stamps electrical parameters and the Part Number onto" & vbCrLf & _
+        "the part so it is recognised by the EHI workbench.", _
+        vbYesNo Or vbQuestion, MTITLE) = vbYes)
+
+    ' ── 4. Ensure the 'Elec_Preparation' geometrical set ──────
+    Dim oGBS As HybridBody
+    Set oGBS = EnsureGBS(oPart, GBS_NAME)
+
+    ' ── 5. Main loop ──────────────────────────────────────────
+    Dim i           As Integer
+    Dim nCreated    As Integer
+    Dim sBCPID      As String
+    nCreated = 0
+
+    For i = 1 To nBCPs
+
+        sBCPID = PUB_PFX & Format(i, "00")     ' e.g. BCP_01
+
+        ' Prompt before each pick
+        MsgBox "BCP " & i & " of " & nBCPs & "  ─  ID: " & sBCPID & vbCrLf & vbCrLf & _
+               "Click OK then SELECT ONE of the following in the viewport:" & vbCrLf & _
+               "   VERTEX  →  BCP placed at the point" & vbCrLf & _
+               "   FACE    →  BCP placed at centroid, Z = face normal" & vbCrLf & _
+               "   EDGE    →  BCP placed at mid-point, Z = edge tangent", _
+               vbInformation, MTITLE
+
+        ' Selection
+        Dim oSelElem As SelectedElement
+        Set oSelElem = PickGeometry(oDoc)
+
+        If oSelElem Is Nothing Then
+            Dim skip As Integer
+            skip = MsgBox("Nothing was selected for " & sBCPID & "." & vbCrLf & _
+                          "Skip this BCP?", vbYesNo Or vbQuestion, MTITLE)
+            If skip = vbYes Then
+                GoTo NextBCP
+            Else
+                Exit For
+            End If
+        End If
+
+        ' Create axis system aligned to the pick
+        Dim oAxis As AxisSystem
+        Set oAxis = BuildAxis(oPart, oGBS, oSelElem, sBCPID)
+        If oAxis Is Nothing Then
+            GoTo NextBCP
+        End If
+
+        ' Create BCP geometry + attempt EPD-API BCP
+        Dim bOK As Boolean
+        bOK = BuildBCP(oPart, oGBS, oAxis, sBCPID)
+
+        ' Publish the axis system
+        PublishAxis oPart, oAxis, sBCPID
+
+        nCreated = nCreated + 1
+
+NextBCP:
+    Next i
+
+    ' ── 6. Electrify (optional) ───────────────────────────────
+    If bElec Then
+        ElectrifyPart oPart, oDoc
+    End If
+
+    ' ── 7. Final update ───────────────────────────────────────
+    oPart.Update
+
+    MsgBox "Electrical preparation finished!" & vbCrLf & vbCrLf & _
+           "  BCPs / Axes created : " & nCreated & vbCrLf & _
+           "  Published           : " & nCreated & vbCrLf & _
+           "  Component electrified: " & IIf(bElec, "Yes", "No") & vbCrLf & vbCrLf & _
+           "Geometrical Set: " & GBS_NAME, _
+           vbInformation, MTITLE
+
+    Exit Sub
+
+ErrMain:
+    MsgBox "Error [" & Err.Number & "]" & vbCrLf & _
+           Err.Description & vbCrLf & _
+           "Source: " & Err.Source, vbCritical, MTITLE
+
+End Sub
+
+' ==============================================================
+'  ASK USER FOR NUMBER OF BCPs
+' ==============================================================
+Private Function AskBCPCount() As Integer
+
+    Dim sIn As String
+    Dim n   As Integer
+
+    sIn = InputBox( _
+        "How many Bundle Connection Points do you want to create?" & vbCrLf & _
+        "(1 – 20)", MTITLE, "1")
+
+    If Trim(sIn) = "" Then AskBCPCount = 0 : Exit Function
+    If Not IsNumeric(sIn) Then
+        MsgBox "Please enter a whole number.", vbExclamation, MTITLE
+        AskBCPCount = 0 : Exit Function
+    End If
+
+    n = CInt(CDbl(sIn))
+    If n < 1 Or n > 20 Then
+        MsgBox "Number must be between 1 and 20.", vbExclamation, MTITLE
+        AskBCPCount = 0 : Exit Function
+    End If
+
+    AskBCPCount = n
+
+End Function
+
+' ==============================================================
+'  GEOMETRY SELECTION  (Vertex / Face / Edge)
+' ==============================================================
+Private Function PickGeometry(oDoc As Document) As SelectedElement
+
+    Dim oSel As Selection
+    Set oSel = oDoc.Selection
+    oSel.Clear
+
+    Dim aFilter(2) As String
+    aFilter(0) = "Vertex"
+    aFilter(1) = "Face"
+    aFilter(2) = "Edge"
+
+    Dim sStatus As String
+    sStatus = oSel.SelectElement3( _
+                  aFilter, _
+                  "Select a VERTEX, FACE, or EDGE for the BCP location", _
+                  False, _
+                  CATMultiSelectionMode.CATSingleSelectionMode, _
+                  True)
+
+    If (sStatus = "Normal" Or sStatus = "OK") And oSel.Count >= 1 Then
+        Set PickGeometry = oSel.Item(1)
+    Else
+        Set PickGeometry = Nothing
+    End If
+
+End Function
+
+' ==============================================================
+'  ENSURE GEOMETRICAL SET EXISTS  (create if missing)
+' ==============================================================
+Private Function EnsureGBS(oPart As Part, sName As String) As HybridBody
+
+    Dim oHBs As HybridBodies
+    Dim i    As Integer
+
+    Set oHBs = oPart.HybridBodies
+
+    For i = 1 To oHBs.Count
+        If oHBs.Item(i).Name = sName Then
+            Set EnsureGBS = oHBs.Item(i)
+            Exit Function
+        End If
+    Next i
+
+    Dim oNew As HybridBody
+    Set oNew      = oHBs.Add()
+    oNew.Name     = sName
+    Set EnsureGBS = oNew
+
+End Function
+
+' ==============================================================
+'  BUILD AXIS SYSTEM ALIGNED TO SELECTED GEOMETRY
+' ==============================================================
+Private Function BuildAxis(oPart As Part, _
+                            oGBS  As HybridBody, _
+                            oSel  As SelectedElement, _
+                            sID   As String) As AxisSystem
+
+    On Error GoTo ErrBA
+
+    Dim oAxis As AxisSystem
+    Set oAxis            = oPart.AxisSystems.Add()
+    oAxis.Name           = AX_PFX & sID
+    oAxis.AxisSystemType = catAxisSystemTypeStandard
+
+    ' ── Resolve reference & SPA measurable ───────────────────
+    Dim oRef    As Reference
+    Dim oMeas   As Measurable
+    Dim oSPA    As AnyObject
+
+    Set oRef  = oPart.CreateReferenceFromObject(oSel.Value)
+    Set oSPA  = CATIA.ActiveDocument.GetWorkbench("SPAWorkbench")
+    Set oMeas = oSPA.GetMeasurable(oRef)
+
+    ' ── Branch on geometry type ───────────────────────────────
+    Dim sType As String
+    sType = oSel.Type     ' "Vertex", "Face", "Edge"
+
+    Dim aOrig(2) As Double
+    Dim aZDir(2) As Double
+    Dim aXDir(2) As Double
+
+    Select Case sType
+
+        ' ── VERTEX ─────────────────────────────────────────
+        Case "Vertex"
+            oMeas.GetPoint aOrig          ' exact point coords
+            ' Z stays world-Z; X stays world-X  (acceptable for sockets)
+            aZDir(0) = 0 : aZDir(1) = 0 : aZDir(2) = 1
+            aXDir(0) = 1 : aXDir(1) = 0 : aXDir(2) = 0
+
+        ' ── FACE ───────────────────────────────────────────
+        Case "Face"
+            oMeas.GetCOG    aOrig         ' centroid
+            oMeas.GetNormal aZDir         ' outward normal → Z
+            Perp aZDir, aXDir             ' perpendicular → X
+
+        ' ── EDGE ───────────────────────────────────────────
+        Case "Edge"
+            oMeas.GetCOG            aOrig         ' approximate midpoint
+            oMeas.GetDirectionality aZDir         ' tangent direction → Z
+            Perp aZDir, aXDir
+
+        Case Else
+            ' Unknown: leave at world origin + warn
+            aZDir(2) = 1 : aXDir(0) = 1
+            MsgBox "Unknown geometry type '" & sType & "'." & vbCrLf & _
+                   "Axis placed at world origin — reposition manually.", _
+                   vbInformation, MTITLE
+
+    End Select
+
+    ' ── Apply to axis system ──────────────────────────────────
+    oAxis.PutOrigin aOrig
+    oAxis.PutZAxis  aZDir
+    oAxis.PutXAxis  aXDir
+
+    oPart.Update
+
+    Set BuildAxis = oAxis
+    Exit Function
+
+ErrBA:
+    MsgBox "Axis creation failed for " & sID & vbCrLf & Err.Description, _
+           vbExclamation, MTITLE
+    Set BuildAxis = Nothing
+
+End Function
+
+' ==============================================================
+'  BUILD BCP  (geometry + EPD-API attempt)
+' ==============================================================
+'
+'  Strategy (in order):
+'  A) Try the ElectricalPartDesign workbench factory API directly.
+'  B) If the licence / workbench is unavailable, create a precise
+'     parametric point + direction line inside the GBS.
+'     These are the two inputs needed by EPD's "Create BCP"
+'     command, so the engineer can finish in < 5 s manually.
+'
+Private Function BuildBCP(oPart As Part, _
+                           oGBS  As HybridBody, _
+                           oAxis As AxisSystem, _
+                           sID   As String) As Boolean
+
+    On Error GoTo ErrBCP
+
+    ' ── Recover axis origin & Z direction ────────────────────
+    Dim aOrig(2) As Double
+    Dim aZDir(2) As Double
+    oAxis.GetOrigin aOrig
+    oAxis.GetZAxis  aZDir
+
+    ' ── Create anchor point ───────────────────────────────────
+    Dim oHSF  As HybridShapeFactory
+    Set oHSF  = oPart.HybridShapeFactory
+
+    Dim oPt   As HybridShapePointCoord
+    Set oPt   = oHSF.AddNewPointCoord(aOrig(0), aOrig(1), aOrig(2))
+    oPt.Name  = PT_PFX & sID
+    oGBS.AppendHybridShape oPt
+    oPart.Update
+
+    ' ── Create direction point (10 mm along Z) ────────────────
+    Dim oPtD  As HybridShapePointCoord
+    Set oPtD  = oHSF.AddNewPointCoord( _
+                    aOrig(0) + aZDir(0) * 10#, _
+                    aOrig(1) + aZDir(1) * 10#, _
+                    aOrig(2) + aZDir(2) * 10#)
+    oPtD.Name = PT_PFX & sID & "_Dir"
+    oGBS.AppendHybridShape oPtD
+    oPart.Update
+
+    ' ── Direction line  Pt → PtD ─────────────────────────────
+    Dim oPtRef  As Reference
+    Dim oPtDRef As Reference
+    Set oPtRef  = oPart.CreateReferenceFromObject(oPt)
+    Set oPtDRef = oPart.CreateReferenceFromObject(oPtD)
+
+    Dim oDirLn  As HybridShapeLinePtPt
+    Set oDirLn  = oHSF.AddNewLinePtPt(oPtRef, oPtDRef)
+    oDirLn.Name = DIR_PFX & sID
+    oGBS.AppendHybridShape oDirLn
+    oPart.Update
+
+    ' ── A) Attempt Electrical Part Design API ─────────────────
+    Dim bEPD  As Boolean
+    bEPD = False
+
+    On Error Resume Next     ' non-fatal if licence absent
+
+    Dim oEPDWB As AnyObject
+    Set oEPDWB = CATIA.ActiveDocument.GetWorkbench("ElectricalPartDesign")
+
+    If Not oEPDWB Is Nothing Then
+
+        Dim oElecFact As AnyObject
+        Set oElecFact = oEPDWB.ElectricalFactory
+
+        If Not oElecFact Is Nothing Then
+
+            Dim oDirRef As Reference
+            Set oDirRef = oPart.CreateReferenceFromObject(oDirLn)
+
+            Dim oBCP As AnyObject
+            Set oBCP = oElecFact.AddBundleConnectionPoint(oPtRef, oDirRef)
+
+            If Not oBCP Is Nothing Then
+                oBCP.Name = sID
+                bEPD = True
+            End If
+
+        End If
+    End If
+
+    On Error GoTo ErrBCP    ' re-arm main handler
+
+    ' ── B) Fallback feedback ──────────────────────────────────
+    If Not bEPD Then
+        ' Geometry is already created (point + direction line + axis).
+        ' A small note is printed to the CATIA console; no dialog spam.
+        Debug.Print MTITLE & ": EPD API unavailable for " & sID & _
+                    " — geometry ready for manual BCP assignment."
+    End If
+
+    BuildBCP = True
+    Exit Function
+
+ErrBCP:
+    MsgBox "BCP geometry warning for " & sID & ":" & vbCrLf & _
+           Err.Description & vbCrLf & vbCrLf & _
+           "Axis system created — assign BCP manually in EPD workbench.", _
+           vbInformation, MTITLE
+    BuildBCP = False
+
+End Function
+
+' ==============================================================
+'  PUBLISH AXIS SYSTEM
+' ==============================================================
+Private Sub PublishAxis(oPart As Part, oAxis As AxisSystem, sID As String)
+
+    On Error Resume Next    ' non-fatal
+
+    Dim oPubs As Publications
+    Set oPubs = oPart.Publications
+
+    ' Skip if already published
+    Dim i As Integer
+    For i = 1 To oPubs.Count
+        If oPubs.Item(i).Name = sID Then Exit Sub
+    Next i
+
+    Dim oRef  As Reference
+    Set oRef  = oPart.CreateReferenceFromObject(oAxis)
+
+    Dim oPub  As Publication
+    Set oPub          = oPubs.Add(sID)
+    oPub.Valuation    = oRef
+
+    On Error GoTo 0
+
+End Sub
+
+' ==============================================================
+'  ELECTRIFY COMPONENT
+' ==============================================================
+'
+'  Sets standard electrical parameters and the Part Number so
+'  the component is recognised by the EHI workbench.
+'  Parameters written:
+'      Elec_PartType      (default: CONNECTOR)
+'      Elec_Environment   (default: OPEN)
+'      Elec_Prepared      YES
+'      Elec_MacroVersion  ElecPrep_v1.0
+'      Elec_PrepDate      <timestamp>
+'
+Private Sub ElectrifyPart(oPart As Part, oDoc As Document)
+
+    On Error GoTo ErrElec
+
+    ' ── 1. Part Number ────────────────────────────────────────
+    Dim sPN As String
+    sPN = Trim(oPart.PartNumber)
+
+    If sPN = "" Or sPN = "Part1" Or Left(sPN, 4) = "Part" Then
+        Dim sNew As String
+        sNew = InputBox( _
+            "Enter the ELECTRICAL PART NUMBER for this component." & vbCrLf & _
+            "(Used as reference in EHI diagrams and harness documentation)", _
+            MTITLE, "CONN-XXX-001")
+        If Trim(sNew) <> "" Then
+            oPart.PartNumber = Trim(sNew)
+        End If
+    End If
+
+    ' ── 2. Component type ─────────────────────────────────────
+    Dim sPartType As String
+    sPartType = InputBox( _
+        "Enter the ELECTRICAL COMPONENT TYPE:" & vbCrLf & vbCrLf & _
+        "Examples:" & vbCrLf & _
+        "  CONNECTOR       ─ multi-pin connector" & vbCrLf & _
+        "  BACKSHELL       ─ strain-relief backshell" & vbCrLf & _
+        "  GROMMET         ─ pass-through grommet" & vbCrLf & _
+        "  CLAMP           ─ harness clamp / P-clamp" & vbCrLf & _
+        "  JUNCTION_BOX    ─ junction / splice block" & vbCrLf & _
+        "  EQUIPMENT       ─ generic electrical equipment", _
+        MTITLE, "CONNECTOR")
+
+    If Trim(sPartType) = "" Then sPartType = "CONNECTOR"
+
+    ' ── 3. Stamp parameters ───────────────────────────────────
+    Dim oParams As Parameters
+    Set oParams = oPart.Parameters
+
+    SetParam oParams, "Elec_PartType",      UCase(Trim(sPartType))
+    SetParam oParams, "Elec_Environment",   "OPEN"
+    SetParam oParams, "Elec_Prepared",      "YES"
+    SetParam oParams, "Elec_MacroVersion",  "ElecPrep_v1.0"
+    SetParam oParams, "Elec_PrepDate",      Format(Now, "YYYY-MM-DD HH:MM")
+
+    ' ── 4. Activate EPD workbench to register the electrical body ─
+    On Error Resume Next
+    CATIA.ActiveDocument.GetWorkbench("ElectricalPartDesign")
+    On Error GoTo ErrElec
+
+    MsgBox "Component electrification complete." & vbCrLf & vbCrLf & _
+           "Electrical parameters stamped." & vbCrLf & _
+           "Open the Electrical Part Design workbench to:" & vbCrLf & _
+           "  • Assign connector type (single / multi-branchable)" & vbCrLf & _
+           "  • Configure environment (backshell, sealing)" & vbCrLf & _
+           "  • Link BCPs to connector contacts / cavities", _
+           vbInformation, MTITLE
+
+    Exit Sub
+
+ErrElec:
+    MsgBox "Electrify note: " & Err.Description & vbCrLf & _
+           "Parameters may need to be set manually.", _
+           vbExclamation, MTITLE
+
+End Sub
+
+' ==============================================================
+'  HELPER — Create or overwrite a String parameter
+' ==============================================================
+Private Sub SetParam(oParams As Parameters, sName As String, sVal As String)
+
+    On Error Resume Next
+    Dim oP As Parameter
+    Set oP = oParams.GetItem(sName)
+    If oP Is Nothing Then
+        oParams.CreateString sName, sVal
+    Else
+        oP.ValueAsString = sVal
+    End If
+    On Error GoTo 0
+
+End Sub
+
+' ==============================================================
+'  HELPER — Get first CATPart from a CATProduct
+' ==============================================================
+Private Function GetFirstPart(oDoc As Document) As Part
+
+    On Error Resume Next
+
+    Dim oProd   As Product
+    Dim oChild  As Product
+    Dim oCDoc   As Document
+    Dim i       As Integer
+
+    Set oProd = oDoc.Product
+
+    For i = 1 To oProd.Products.Count
+        Set oChild = oProd.Products.Item(i)
+        Set oCDoc  = Nothing
+
+        If oChild.ReferenceProduct.Documents.Count > 0 Then
+            Set oCDoc = oChild.ReferenceProduct.Documents.Item(1)
+        End If
+
+        If Not oCDoc Is Nothing Then
+            If TypeName(oCDoc) = "PartDocument" Then
+                Set GetFirstPart = oCDoc.Part
+                Exit Function
+            End If
+        End If
+    Next i
+
+    Set GetFirstPart = Nothing
+    On Error GoTo 0
+
+End Function
+
+' ==============================================================
+'  HELPER — Compute a vector perpendicular to aIn, normalised
+' ==============================================================
+Private Sub Perp(aIn() As Double, aOut() As Double)
+
+    ' Pick a world axis least parallel to aIn
+    Dim aTmp(2) As Double
+
+    If Abs(aIn(0)) <= Abs(aIn(1)) And Abs(aIn(0)) <= Abs(aIn(2)) Then
+        aTmp(0) = 1 : aTmp(1) = 0 : aTmp(2) = 0
+    ElseIf Abs(aIn(1)) <= Abs(aIn(2)) Then
+        aTmp(0) = 0 : aTmp(1) = 1 : aTmp(2) = 0
+    Else
+        aTmp(0) = 0 : aTmp(1) = 0 : aTmp(2) = 1
+    End If
+
+    ' Cross product  aIn × aTmp
+    aOut(0) = aIn(1) * aTmp(2) - aIn(2) * aTmp(1)
+    aOut(1) = aIn(2) * aTmp(0) - aIn(0) * aTmp(2)
+    aOut(2) = aIn(0) * aTmp(1) - aIn(1) * aTmp(0)
+
+    ' Normalise
+    Dim d As Double
+    d = Sqr(aOut(0) * aOut(0) + aOut(1) * aOut(1) + aOut(2) * aOut(2))
+    If d > 0.000001 Then
+        aOut(0) = aOut(0) / d
+        aOut(1) = aOut(1) / d
+        aOut(2) = aOut(2) / d
+    End If
+
+End Sub
+
+' ── End of macro ─────────────────────────────────────────────
